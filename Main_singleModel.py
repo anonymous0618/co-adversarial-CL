@@ -2,7 +2,7 @@ import torch as t
 import Utils.TimeLogger as logger
 from Utils.TimeLogger import log
 from Params import args
-from Model import BiasMF, LightGCN, HGNN
+from Model import BiasMF, LightGCN
 from DataHandler import DataHandler
 import numpy as np
 import pickle
@@ -31,13 +31,14 @@ class Coach:
 		return ret
 
 	def run(self):
+		self.prepareModel()
+		log('Model Prepared')
 		if args.load_model != None:
 			self.loadModel()
 			stloc = len(self.metrics['TrainLoss']) * args.tstEpoch - (args.tstEpoch - 1)
 		else:
 			stloc = 0
-			self.prepareModel()
-			log('Model Prepared')
+			log('Model Initialized')
 		for ep in range(stloc, args.epoch):
 			tstFlag = (ep % args.tstEpoch == 0)
 			reses = self.trainEpoch()
@@ -53,33 +54,20 @@ class Coach:
 
 	def prepareModel(self):
 		self.LightGCN = LightGCN().cuda()
-		# self.LightGCN2 = self.LightGCN#LightGCN().cuda()
 		self.BiasMF = BiasMF().cuda()
-		# self.HGNN = HGNN().cuda()
 		self.gcnOpt = t.optim.Adam(self.LightGCN.parameters(), lr=args.lr, weight_decay=0)
-		# self.gcnOpt2 = t.optim.Adam(self.LightGCN2.parameters(), lr=args.lr, weight_decay=0)
 		self.mfOpt = t.optim.Adam(self.BiasMF.parameters(), lr=args.lr, weight_decay=0)
-		# self.hgnnOpt = t.optim.Adam(self.HGNN.parameters(), lr=args.lr, weight_decay=0)
 
-	def trainUtil(self, model, opt, usr, itmP, itmN, params=list()):
-		predsP = model.predPairs(*(params + [usr, itmP]))
-		predsN = model.predPairs(*(params + [usr, itmN]))
-		scoreDiff = predsP - predsN
-		bprLoss = - scoreDiff.sigmoid().log().sum() / args.batch
-		regLoss = 0
-		for W in model.parameters():
-			regLoss += W.norm(2).square()
-		regLoss *= args.reg
-		loss = bprLoss + regLoss
-		opt.zero_grad()
-		loss.backward()
-		opt.step()
-		return loss, bprLoss
+	def innerProduct(self, usrEmbed, itmEmbed):
+		return t.sum(usrEmbed * itmEmbed, axis=-1).view(-1)
+
+	def pairPredict(self, usrEmbed, itmPEmbed, itmNEmbed):
+		return self.innerProduct(usrEmbed, itmPEmbed) - self.innerProduct(usrEmbed, itmNEmbed)
 
 	def trainEpoch(self):
 		trnLoader = self.handler.trnLoader
 		trnLoader.dataset.negSampling()
-		epMfLoss, epMfPreLoss, epGcnLoss, epGcnPreLoss = [0] * 4
+		epLoss, epPreLoss = 0, 0
 		i = 0
 		steps = trnLoader.dataset.__len__() // args.batch
 		for usr, itmP, itmN, advNegs in trnLoader:
@@ -87,44 +75,28 @@ class Coach:
 			usr = usr.long().cuda()
 			itmP = itmP.long().cuda()
 			itmN = itmN.long().cuda()
-			advNegs = advNegs.long().cuda()
-
-			# train mf
-			mfLoss, mfPreLoss = self.trainUtil(self.BiasMF, self.mfOpt, usr, itmP, itmN)
-			epMfLoss += mfLoss.item()
-			epMfPreLoss += mfPreLoss.item()
 
 			# train lightgcn
-			gcnLoss, gcnPreLoss = self.trainUtil(self.LightGCN, self.gcnOpt, usr, itmP, itmN, [self.handler.torchAdj])
-			epGcnLoss += gcnLoss.item()
-			epGcnPreLoss += gcnPreLoss.item()
+			predsP = self.LightGCN.predPairs(self.handler.torchAdj, usr, itmP)
+			predsN = self.LightGCN.predPairs(self.handler.torchAdj, usr, itmN)
+			scoreDiff = predsP - predsN
+			bprLoss = - (scoreDiff).sigmoid().log().sum() / args.batch
+			regLoss = 0
+			for W in self.LightGCN.parameters():
+				regLoss += W.norm(2).square()
+			regLoss *= args.reg
+			loss = bprLoss + regLoss
+			epLoss += loss.item()
+			epPreLoss += bprLoss.item()
+			self.gcnOpt.zero_grad()
+			loss.backward()
+			self.gcnOpt.step()
 
-			# MF generate, GCN discriminate
-			batPreds = self.BiasMF.predBatch(usr, advNegs)
-			_, topLocs = t.topk(batPreds, 1)
-			itmG = t.gather(advNegs, 1, topLocs).view(-1)
-			gcnLoss, gcnPreLoss = self.trainUtil(self.LightGCN, self.gcnOpt, usr, itmP, itmG, [self.handler.torchAdj])
-			epGcnLoss += gcnLoss.item()
-			epGcnPreLoss += gcnPreLoss.item()
-			gcnLoss, gcnPreLoss = self.trainUtil(self.LightGCN, self.gcnOpt, usr, itmG, itmN, [self.handler.torchAdj])
-			epGcnLoss += gcnLoss.item()
-			epGcnPreLoss += gcnPreLoss.item()
 
-			# GCN generate, MF discriminate
-			batPreds = self.LightGCN.predBatch(self.handler.torchAdj, usr, advNegs)
-			_, topLocs = t.topk(batPreds, 1)
-			itmG = t.gather(advNegs, 1, topLocs).view(-1)
-			mfLoss, mfPreLoss = self.trainUtil(self.BiasMF, self.mfOpt, usr, itmP, itmG)
-			epMfLoss += mfLoss.item()
-			epMfPreLoss += mfPreLoss.item()
-			mfLoss, mfPreLoss = self.trainUtil(self.BiasMF, self.mfOpt, usr, itmG, itmN)
-			epMfLoss += mfLoss.item()
-			epMfPreLoss += mfPreLoss.item()
-
-			log('Step %d/%d         ' % (i, steps), save=False, oneline=True)
+			log('Step %d/%d: loss = %.3f, regLoss = %.3f         ' % (i, steps, loss, regLoss), save=False, oneline=True)
 		ret = dict()
-		ret['Loss'] = epGcnLoss / steps
-		ret['preLoss'] = epGcnPreLoss / steps
+		ret['Loss'] = epLoss / steps
+		ret['preLoss'] = epPreLoss / steps
 		return ret
 
 	def testEpoch(self):
@@ -180,9 +152,7 @@ class Coach:
 
 		content = {
 			'BiasMF': self.BiasMF,
-			'LightGCN': self.LightGCN,
-			# 'LightGCN2': self.LightGCN2,
-			# 'HGNN': self.HGNN
+			'LightGCN': self.LightGCN
 		}
 		t.save(content, 'Models/' + args.save_path + '.mod')
 		log('Model Saved: %s' % args.save_path)
@@ -191,8 +161,6 @@ class Coach:
 		ckp = t.load('Models/' + args.load_model + '.mod')
 		self.BiasMF = ckp['BiasMF']
 		self.LightGCN = ckp['LightGCN']
-		# self.LightGCN2 = ckp['LightGCN2']
-		# self.HGNN = ckp['HGNN']
 
 		with open('History/' + args.load_model + '.his', 'rb') as fs:
 			self.metrics = pickle.load(fs)
