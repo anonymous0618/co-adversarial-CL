@@ -10,4 +10,4 @@ Some important hyperparameters:
 * advBat: number of sampled items from which to find out i_G
 
 
-BiasMF and LightGCN are implemented in Main_singleMethod.py, change the called object (self.LightGCN, self.BiasMF) in trainEpoch, testEpoch to change the model.
+BiasMF and LightGCN are implemented in Main_singleModel.py, change the called object (self.LightGCN, self.BiasMF) in trainEpoch, testEpoch to change the model.
